@@ -245,3 +245,22 @@ test("free multiline answers survive Escape without blur", async ({ page }) => {
   const saved = (await state(page)).intakes.find((item: { patientId: string }) => item.patientId === "p1");
   expect(saved.answers.meds.value).toContain("جعبه‌اش را می‌آورم");
 });
+
+test("option-first form keeps descriptions optional and persists quick selections", async ({ page }) => {
+  await asPatient(page);
+  const dialog = await openIntake(page);
+  const allergy = dialog.locator('[data-question="allergy"]');
+  await allergy.getByRole("button", { name: "حساسیت ندارم", exact: true }).click();
+  await expect(allergy.getByRole("button", { name: "حساسیت ندارم", exact: true })).toHaveAttribute("aria-pressed", "true");
+  await expect(allergy.locator(".intake-free-answer textarea")).toHaveCount(0);
+  await allergy.locator(".intake-note-disclosure > summary").click();
+  await allergy.getByLabel("یادداشت تکمیلی allergy").fill("یک بار بعد از غذا خارش داشتم\nاسمش یادم نیست");
+  await allergy.getByLabel("یادداشت تکمیلی allergy").blur();
+  const saved = (await state(page)).intakes.find((item: { patientId: string }) => item.patientId === "p1");
+  expect(saved.answers.allergy.value).toBe("حساسیت ندارم");
+  expect(saved.answers.allergy.note).toContain("اسمش یادم نیست");
+  await allergy.getByRole("button", { name: "پاسخ دیگر / نوشتن", exact: true }).click();
+  await expect(allergy.getByLabel("حساسیت دارویی", { exact: true })).toBeVisible();
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBeTruthy();
+});

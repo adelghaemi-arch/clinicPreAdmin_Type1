@@ -49,7 +49,7 @@ export default function IntakeModal({
   );
   const existing = getIntake(data, appointmentId);
 
-  const [mode, setMode] = useState<"chat" | "form">(readOnly ? "form" : "chat");
+  const [mode, setMode] = useState<"chat" | "form">("form");
   const [values, setValues] = useState<Record<string, string>>(() => {
     const initial: Record<string, string> = {};
     questions.forEach((question) => {
@@ -482,7 +482,7 @@ export default function IntakeModal({
         </>
       }
     >
-      <div className="intake-page">
+      <div className={`intake-page ${mode === "form" ? "is-simple" : ""}`}>
         <header className="intake-page-head">
           <div className="intake-context">
             <Avatar name={patient.name} />
@@ -567,10 +567,13 @@ export default function IntakeModal({
                     <QuestionInput
                       question={question}
                       value={values[question.id] || ""}
-                      onChange={(value) => setValue(question.id, value)}
+                      onChange={(value) => { setValue(question.id, value); }}
+                      onChoice={(value) => { const next = { ...values, [question.id]: value }; setValues(next); persistDraftSilent(next); }}
                       onBlur={() => persistDraftSilent()}
                       disabled={readOnly}
                     />
+                    <details className="intake-note-disclosure" open={undefined}>
+                      <summary>افزودن توضیح (اختیاری)</summary>
                     <label className="intake-note-field">
                       <span>توضیح بیشتر (اختیاری، چندخطی)</span>
                       <textarea
@@ -586,6 +589,7 @@ export default function IntakeModal({
                         onBlur={() => persistDraftSilent()}
                       />
                     </label>
+                    </details>
                   </section>
                 ))}
 
@@ -634,39 +638,7 @@ export default function IntakeModal({
 
                 {analysisCard}
 
-                {review || mode === "form" ? (
-                  <section className="intake-review">
-                    <h3>
-                      <Check size={18} />
-                      مرور پاسخ‌های شما
-                    </h3>
-                    <ul>
-                      {questions.map((question) => (
-                        <li
-                          key={question.id}
-                          className={
-                            !values[question.id]?.trim() && question.required
-                              ? "is-missing"
-                              : ""
-                          }
-                        >
-                          <span>{question.label}</span>
-                          <div>
-                            <b>
-                              {values[question.id]?.trim() ||
-                                (question.required
-                                  ? "بی‌پاسخ"
-                                  : "ترجیح می‌دهم حضوری بگویم")}
-                            </b>
-                            {notes[question.id]?.trim() && (
-                              <p>{notes[question.id]}</p>
-                            )}
-                          </div>
-                        </li>
-                      ))}
-                    </ul>
-                  </section>
-                ) : null}
+
               </div>
             ) : review ? (
               <div className="intake-review">
@@ -746,9 +718,11 @@ export default function IntakeModal({
                       question={current}
                       value={values[current.id] || ""}
                       onChange={(value) => answer(value)}
-                      onChoice={(value) => answer(value, true)}
+                      onChoice={(value) => answer(value)}
                       onBlur={() => persistDraftSilent()}
                     />
+                    <details className="intake-note-disclosure" open={undefined}>
+                      <summary>افزودن توضیح (اختیاری)</summary>
                     <label className="intake-note-field">
                       <span>توضیح بیشتر (اختیاری، چندخطی)</span>
                       <textarea
@@ -763,6 +737,7 @@ export default function IntakeModal({
                         onBlur={() => persistDraftSilent()}
                       />
                     </label>
+                    </details>
                     <div className="intake-answer-actions">
                       <button
                         className="button secondary small"
@@ -777,7 +752,7 @@ export default function IntakeModal({
                           فعلاً نمی‌دانم
                         </button>
                       )}
-                      {current.type !== "choice" && (
+                      {(
                         <button
                           className="button primary small"
                           onClick={() => answer(values[current.id] || "", true)}
@@ -890,12 +865,35 @@ function QuestionInput({
   onBlur?: () => void;
   disabled?: boolean;
 }) {
+  const [customOpen, setCustomOpen] = useState(false);
+  const quickOptions: Record<string, string[]> = {
+    meds: ["دارویی نمی‌خورم", "دارو مصرف می‌کنم", "اسم دارو یادم نیست"],
+    allergy: ["حساسیت ندارم", "حساسیت دارم", "مطمئن نیستم"],
+    surgery: ["عمل نداشتم", "قبلاً عمل داشتم", "یادم نیست"],
+    episode: ["اخیراً حالم بد نشده", "هفته پیش", "ماه گذشته", "مدت‌ها پیش"],
+    trigger: ["کم‌خوابی", "استرس", "فعالیت", "نمی‌دانم"],
+    imaging: ["نداشتم", "MRI داشتم", "CT داشتم", "یادم نیست"],
+    cardiac: ["سابقه ندارم", "نوار قلب داشتم", "عمل قلب داشتم"],
+    family: ["سابقه نداریم", "پدر یا مادرم", "خواهر یا برادرم", "نمی‌دانم"],
+    implant: ["ندارم", "دارم", "مطمئن نیستم"],
+    lens: ["هیچ‌کدام", "عینک", "لنز"],
+    eyesurgery: ["عمل نکرده‌ام", "عمل یا لیزر داشته‌ام"],
+    gyn: ["سابقه ندارم", "زایمان داشتم", "عمل داشتم"],
+    reason: ["بررسی عمومی", "درد دارم", "پیگیری درمان", "حالم خوب نیست"],
+    guardian: ["مادر", "پدر", "همراه دیگر"],
+  };
+  const options = question.options || quickOptions[question.id] || [];
+  const structured = question.type === "number" || question.type === "date";
+  const isCustom = Boolean(value && !options.includes(value));
+  const showText = !structured && (customOpen || isCustom || !options.length);
   return (
     <div className="intake-free-answer">
-      {question.options && <div className="intake-options">
-        {question.options.map((option) => <button type="button" key={option} aria-label={option} aria-pressed={value === option} className={value === option ? "chosen" : ""} disabled={disabled} onClick={() => (onChoice || onChange)(option)} onBlur={onBlur}>{option}</button>)}
+      {!!options.length && <div className="intake-options">
+        {options.map((option) => <button type="button" key={option} aria-label={option} aria-pressed={value === option} className={value === option ? "chosen" : ""} disabled={disabled} onClick={() => { setCustomOpen(false); (onChoice || onChange)(option); }} onBlur={onBlur}>{option}</button>)}
+        <button type="button" className={showText ? "chosen" : ""} aria-expanded={showText} disabled={disabled} onClick={() => setCustomOpen(!customOpen)}>پاسخ دیگر / نوشتن</button>
       </div>}
-      <textarea aria-label={question.label} rows={3} maxLength={5000} value={value} disabled={disabled} placeholder={question.placeholder || "هرچه لازم می‌دانید با زبان خودتان بنویسید…"} onChange={(event) => onChange(event.target.value)} onBlur={onBlur} />
+      {structured && <input aria-label={question.label} type={question.type === "number" ? "number" : "date"} min={question.type === "number" ? 0 : undefined} max={question.id === "pain" ? 10 : undefined} value={value} disabled={disabled} onChange={(event) => onChange(event.target.value)} onBlur={onBlur} />}
+      {showText && <textarea aria-label={question.label} rows={3} maxLength={5000} value={value} disabled={disabled} placeholder={question.placeholder || "با زبان خودتان بنویسید…"} onChange={(event) => onChange(event.target.value)} onBlur={onBlur} />}
     </div>
   );
 }

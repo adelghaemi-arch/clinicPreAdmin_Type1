@@ -1505,3 +1505,20 @@
 .intake-file-error { color: var(--danger); }
 .intake-analysis-topics p { white-space: pre-wrap; }
 .ehr-files .intake-attachment { display: flex; align-items: center; gap: 10px; padding: 10px; width: 100%; }
+
+/* Option-first intake: a single quiet column, explanations only on request. */
+.intake-page.is-simple { max-width: 840px; margin-inline: auto; width: 100%; }
+.is-simple .intake-page-body { display: block; }
+.is-simple .intake-page-rail, .is-simple .intake-page-focus { display: none; }
+.is-simple .intake-form-cards { display: grid; grid-template-columns: 1fr; gap: 12px; }
+.is-simple .intake-card { padding: 16px 20px; }
+.is-simple .intake-card > header { margin-bottom: 12px; }
+.is-simple .intake-card > header small { display: none; }
+.intake-note-disclosure { margin-top: 10px; }
+.intake-note-disclosure > summary { cursor: pointer; color: var(--muted); font-size: 12px; padding-block: 6px; }
+.intake-note-disclosure[open] > summary { color: var(--accent); }
+.intake-note-disclosure .intake-note-field > span { display: none; }
+.intake-free-answer > input { max-width: 240px; padding: 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+.is-simple .intake-options { gap: 8px; }
+.is-simple .intake-options button { min-height: 42px; border-radius: 10px; padding: 8px 14px; }
+@media (max-width: 600px) { .is-simple .intake-card { padding: 14px; } .is-simple .intake-page-head { padding: 12px; } }

@@ -624,3 +624,9 @@
     height: 30px;
   }
 }
+
+.pd-today-actions li { padding-block: 9px; gap: 10px; }
+.pd-today-actions li > div { min-width: 0; flex: 1; }
+.pd-today-actions li b { font-size: 12px; }
+.pd-today-actions li small { font-size: 10px; }
+.pd-today-actions li > button { white-space: nowrap; border: 1px solid var(--line); border-radius: 8px; padding: 6px 12px; }

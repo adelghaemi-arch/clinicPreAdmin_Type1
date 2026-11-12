@@ -163,7 +163,7 @@ export default function PatientDashboard() {
             key: "intake",
             icon: ClipboardList,
             tone: "warn",
-            title: "تکمیل پرسش‌های ویزیت",
+            title: "تکمیل پرونده ویزیت",
             meta: `${fa(progress.missing.length)} پرسش ضروری باقی مانده`,
             label: "شروع",
             action: () => setModal({ type: "intake", appointmentId: next.id }),
@@ -541,7 +541,7 @@ export default function PatientDashboard() {
         </section>
         <section className="pd-card">
           <header className="pd-head">
-            <span>کارهای من</span>
+            <span>اقدامات امروز</span>
             <button className="text-action" onClick={() => navigate("inbox")}>
               کارتابل
               <ChevronLeft size={13} />
@@ -549,7 +549,7 @@ export default function PatientDashboard() {
             <b className="pd-count">{fa(tasks.length)}</b>
           </header>
           {tasks.length ? (
-            <ul className="pd-list">
+            <ul className="pd-list pd-today-actions">
               {tasks.map((item) => (
                 <li key={item.key}>
                   <span className={`pd-list-icon tone-${item.tone}`}>
