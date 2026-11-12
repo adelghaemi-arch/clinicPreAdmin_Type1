@@ -4,9 +4,14 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "node scripts/dev.mjs",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "dev:client": "vite",
+    "start": "node server/index.mjs --serve",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test server/*.test.mjs",
+    "test:e2e": "playwright test"
   },
   "dependencies": {
     "@fontsource-variable/vazirmatn": "^5.3.0",

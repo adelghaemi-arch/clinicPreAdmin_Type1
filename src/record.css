@@ -1494,3 +1494,14 @@
     margin-inline-start: auto;
   }
 }
+
+/* Free-form answers and durable attachment previews. */
+.intake-free-answer { display: grid; gap: 10px; width: 100%; min-width: 0; }
+.intake-free-answer textarea { width: 100%; min-height: 100px; resize: vertical; line-height: 1.9; }
+.intake-attachment-info { flex: 1; min-width: 0; }
+.intake-attachment-info b { overflow-wrap: anywhere; }
+.intake-attachment-actions { display: flex; gap: 4px; align-items: center; }
+.intake-file-icon img { width: 40px; height: 40px; object-fit: cover; border-radius: 8px; }
+.intake-file-error { color: var(--danger); }
+.intake-analysis-topics p { white-space: pre-wrap; }
+.ehr-files .intake-attachment { display: flex; align-items: center; gap: 10px; padding: 10px; width: 100%; }

@@ -1,7 +1,9 @@
 import {
   createContext,
+  useCallback,
   useContext,
   useEffect,
+  useRef,
   useState,
   type Dispatch,
   type SetStateAction,
@@ -44,9 +46,13 @@ export function usePersistentState<T>(
   return [value, setValue] as const;
 }
 
+/** Returns whether the new snapshot was actually written to browser storage. */
+export type UpdateClinicData = (update: SetStateAction<ClinicData>) => boolean;
+
 interface ClinicContextValue {
   data: ClinicData;
-  setData: Dispatch<SetStateAction<ClinicData>>;
+  setData: UpdateClinicData;
+  storageHealthy: boolean;
   role: Role;
   page: Page;
   navigate: (page: Page) => void;
@@ -88,11 +94,41 @@ export function ClinicProvider({
   theme: Theme;
   setTheme: Dispatch<SetStateAction<Theme>>;
 }) {
-  const [data, setData] = usePersistentState<ClinicData>(
+  const [data, setStoredData] = usePersistentState<ClinicData>(
     "nabz-clinic-data-v1",
     createSeed,
     normalizeClinicData,
   );
+  const dataRef = useRef(data);
+  const [storageHealthy, setStorageHealthy] = useState(true);
+  const setData = useCallback<UpdateClinicData>(
+    (update) => {
+      const next =
+        typeof update === "function" ? update(dataRef.current) : update;
+      dataRef.current = next;
+      setStoredData(next);
+      try {
+        localStorage.setItem("nabz-clinic-data-v1", JSON.stringify(next));
+        setStorageHealthy(true);
+        return true;
+      } catch {
+        // Keep the session usable in memory, but never claim a durable save.
+        setStorageHealthy(false);
+        return false;
+      }
+    },
+    [setStoredData],
+  );
+  useEffect(() => {
+    try {
+      localStorage.setItem("nabz-storage-check", "1");
+      localStorage.removeItem("nabz-storage-check");
+      localStorage.setItem("nabz-clinic-data-v1", JSON.stringify(dataRef.current));
+      setStorageHealthy(true);
+    } catch {
+      setStorageHealthy(false);
+    }
+  }, []);
   const [modal, setModal] = useState<ModalState>(null);
   function switchPatient(id: string) {
     setModal(null);
@@ -142,6 +178,7 @@ export function ClinicProvider({
       value={{
         data,
         setData,
+        storageHealthy,
         role,
         page,
         navigate,

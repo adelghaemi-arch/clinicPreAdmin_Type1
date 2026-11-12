@@ -9,13 +9,11 @@ import {
   Paperclip,
   Send,
   Sparkles,
-  Trash2,
   Wand2,
   X,
 } from "lucide-react";
 import { fa, persianDate, uid } from "../data";
 import {
-  buildIntakeAnalysis,
   careFocus,
   exampleIntakeAnswers,
   getIntake,
@@ -27,27 +25,16 @@ import { activity, useClinic } from "../store";
 import type { Intake, IntakeAnalysis, IntakeAttachment } from "../types";
 import { Avatar, Modal } from "./ui";
 
-function fileSizeLabel(size: number) {
-  if (size < 1024) return `${fa(size)} بایت`;
-  if (size < 1024 * 1024) return `${fa(Math.round(size / 1024))} کیلوبایت`;
-  return `${fa((size / (1024 * 1024)).toFixed(1))} مگابایت`;
-}
-
-function readFileAsDataUrl(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(String(reader.result || ""));
-    reader.onerror = () => reject(new Error("read"));
-    reader.readAsDataURL(file);
-  });
-}
+import AttachmentView from "./AttachmentView";
+import { storeAttachment, removeAttachment, MAX_FILES, MAX_FILE_SIZE } from "../attachments";
+import { analysisInput, checkAiConnection, createRemoteAnalysis, createLocalAnalysis } from "../intakeAi";
 
 export default function IntakeModal({
   appointmentId,
 }: {
   appointmentId: string;
 }) {
-  const { data, role, patientId, setData, setModal, toast } = useClinic();
+  const { data, role, patientId, setData, setModal, toast, storageHealthy } = useClinic();
   const appointment = data.appointments.find(
     (item) => item.id === appointmentId,
   );
@@ -103,6 +90,15 @@ export default function IntakeModal({
     });
   }, [index, mode]);
 
+  const latestHash = useRef("");
+  const finished = useRef(false);
+  const saveLatest = useRef<(() => void) | null>(null);
+  useEffect(() => {
+    const flush = () => { if (!finished.current) saveLatest.current?.(); };
+    window.addEventListener("pagehide", flush);
+    return () => { window.removeEventListener("pagehide", flush); flush(); };
+  }, []);
+
   const focus = patient ? careFocus(patient, doctor) : null;
   if (!appointment || !patient || !focus) return null;
 
@@ -113,6 +109,7 @@ export default function IntakeModal({
     ]),
   );
   const currentHash = intakeAnswerHash(answersForHash, attachments);
+  latestHash.current = currentHash;
   const storedAnalysis = existing?.analysis;
   const stale = !storedAnalysis || storedAnalysis.answerHash !== currentHash;
   const progressSource: Intake = {
@@ -142,7 +139,6 @@ export default function IntakeModal({
   function persist(
     status: "draft" | "submitted",
     options: {
-      silent?: boolean;
       withAnalysis?: IntakeAnalysis;
       vals?: Record<string, string>;
       nts?: Record<string, string>;
@@ -192,13 +188,9 @@ export default function IntakeModal({
         ),
       };
     }
-    setData((previous) => ({
+    const saved = setData((previous) => ({
       ...previous,
-      intakes: existing
-        ? previous.intakes.map((item) =>
-            item.id === existing.id ? record : item,
-          )
-        : [...previous.intakes, record],
+      intakes: [...previous.intakes.filter((item) => item.appointmentId !== appointmentId), record],
       activities:
         status === "submitted"
           ? [
@@ -211,8 +203,8 @@ export default function IntakeModal({
             ]
           : previous.activities,
     }));
-    setLastSavedAt(now);
-    return record;
+    if (saved) setLastSavedAt(now);
+    return saved;
   }
 
   function persistDraftSilent(
@@ -220,71 +212,70 @@ export default function IntakeModal({
     nts: Record<string, string> = notes,
     files: IntakeAttachment[] = attachments,
   ) {
-    persist("draft", { silent: true, vals, nts, files });
+    persist("draft", { vals, nts, files });
   }
+
+  saveLatest.current = () => {
+    if (!readOnly && currentHash !== intakeAnswerHash(existing?.answers || {}, existing?.attachments || [])) persistDraftSilent();
+  };
 
   function saveDraft() {
-    persist("draft");
-    toast("پیش‌نویس در همین مرورگر ذخیره شد.");
+    if (persist("draft")) toast("پیش‌نویس در همین مرورگر ذخیره شد.");
+    else toast("ذخیره در مرورگر ناموفق بود.", true);
   }
 
-  function computeAnalysis(
-    vals: Record<string, string> = values,
-    nts: Record<string, string> = notes,
-    files: IntakeAttachment[] = attachments,
-  ): IntakeAnalysis {
-    const built = buildIntakeAnalysis(
-      patient!,
-      doctor,
-      questions,
-      Object.fromEntries(
-        questions.map((question) => [
-          question.id,
-          { value: vals[question.id] || "", note: nts[question.id] || "" },
-        ]),
-      ),
-      files,
-    );
-    return {
-      ...built,
-      answerHash: intakeAnswerHash(
-        Object.fromEntries(
-          questions.map((question) => [
-            question.id,
-            { value: vals[question.id] || "", note: nts[question.id] || "" },
-          ]),
-        ),
-        files,
-      ),
-      updatedAt: new Date().toISOString(),
-    };
+  async function computeAnalysis(): Promise<IntakeAnalysis> {
+    const input = analysisInput(patient!, doctor, questions, answersForHash, attachments);
+    let built;
+    if (await checkAiConnection()) {
+      // No silent downgrade after a configured service fails.
+      built = await createRemoteAnalysis(input);
+    } else {
+      built = createLocalAnalysis(patient!, doctor, questions, answersForHash, attachments);
+    }
+    return { ...built, answerHash: currentHash, updatedAt: new Date().toISOString() };
   }
 
-  function runAnalysis() {
+  async function runAnalysis() {
+    if (analyzing) return;
     setAnalyzing(true);
-    window.setTimeout(() => {
-      const analysis = computeAnalysis();
-      persist("draft", { silent: true, withAnalysis: analysis });
-      setAnalyzing(false);
+    try {
+      const analysis = await computeAnalysis();
+      // Results for an earlier revision must never overwrite edits made in flight.
+      if (latestHash.current !== analysis.answerHash) {
+        toast("پاسخ‌ها تغییر کرد؛ دوباره تحلیل کنید.", true);
+        return;
+      }
+      persist("draft", { withAnalysis: analysis });
       setAnalysisOpen(false);
-      toast("تحلیل اطلاعات انجام شد؛ خلاصه را همین‌جا ببینید.");
-    }, 450);
+    } catch {
+      toast("تحلیل انجام نشد؛ پاسخ‌ها محفوظ است. دوباره تلاش کنید.", true);
+    } finally { setAnalyzing(false); }
   }
 
-  function submit() {
+  async function submit() {
+    if (analyzing || readingFiles) return;
     if (!progress.complete) {
-      toast(
-        `هنوز ${fa(progress.missing.length)} پرسش ضروری بی‌پاسخ است.`,
-        true,
-      );
+      toast(`هنوز ${fa(progress.missing.length)} پرسش ضروری بی‌پاسخ است.`, true);
       setMode("form");
       return;
     }
-    // Saving always refreshes the analysis so the physician sees a fresh summary.
-    const analysis = computeAnalysis();
-    persist("submitted", { withAnalysis: analysis });
-    toast("پاسخ‌ها و تحلیل برای پزشک ثبت شد و در پرونده سلامت قرار گرفت.");
-    setModal(null);
+    setAnalyzing(true);
+    try {
+      const analysis = stale ? await computeAnalysis() : storedAnalysis!;
+      if (latestHash.current !== analysis.answerHash) {
+        toast("پاسخ‌ها تغییر کرد؛ دوباره ثبت کنید.", true);
+        return;
+      }
+      if (!persist("submitted", { withAnalysis: analysis })) {
+        toast("ذخیره در مرورگر ناموفق بود؛ فضای ذخیره‌سازی را بررسی کنید.", true);
+        return;
+      }
+      toast("پاسخ‌ها و جمع‌بندی در پرونده ثبت شد.");
+      finished.current = true;
+      setModal(null);
+    } catch { toast("تحلیل انجام نشد؛ پاسخ‌ها را دوباره ثبت کنید.", true); }
+    finally { setAnalyzing(false); }
   }
 
   function setValue(id: string, value: string) {
@@ -299,7 +290,7 @@ export default function IntakeModal({
     const next = { ...values, [current.id]: value };
     setValues(next);
     if (advance) {
-      persist("draft", { silent: true, vals: next });
+      persist("draft", { vals: next });
       setIndex((previous) => previous + 1);
     }
   }
@@ -308,7 +299,7 @@ export default function IntakeModal({
     if (!current) return;
     const next = { ...values, [current.id]: "" };
     setValues(next);
-    persist("draft", { silent: true, vals: next });
+    persist("draft", { vals: next });
     setIndex((previous) => previous + 1);
   }
 
@@ -324,7 +315,7 @@ export default function IntakeModal({
     });
     setValues(nextValues);
     setNotes(nextNotes);
-    persist("draft", { silent: true, vals: nextValues, nts: nextNotes });
+    persist("draft", { vals: nextValues, nts: nextNotes });
     const first = questions.findIndex(
       (question) => question.required && !nextValues[question.id]?.trim(),
     );
@@ -334,13 +325,13 @@ export default function IntakeModal({
 
   async function handleFiles(files: FileList | null) {
     if (!files?.length || readOnly) return;
-    const remaining = 5 - attachments.length;
+    const remaining = MAX_FILES - attachments.length;
     if (remaining <= 0) {
       toast("حداکثر ۵ فایل می‌توانید پیوست کنید.", true);
       return;
     }
     const picked = Array.from(files).slice(0, remaining);
-    const oversized = picked.filter((file) => file.size > 2 * 1024 * 1024);
+    const oversized = picked.filter((file) => file.size > MAX_FILE_SIZE);
     if (oversized.length) {
       toast("هر فایل حداکثر ۲ مگابایت باشد.", true);
       return;
@@ -349,19 +340,20 @@ export default function IntakeModal({
     try {
       const loaded: IntakeAttachment[] = [];
       for (const file of picked) {
-        const dataUrl = await readFileAsDataUrl(file);
+        const id = uid("file");
+        await storeAttachment(id, patient!.id, appointmentId, file);
         loaded.push({
-          id: uid("file"),
+          id,
           name: file.name,
           size: file.size,
           mime: file.type || "فایل",
-          dataUrl: dataUrl.length < 1_200_000 ? dataUrl : undefined,
+          storageKey: id,
           uploadedAt: new Date().toISOString(),
         });
       }
       const nextFiles = [...attachments, ...loaded];
       setAttachments(nextFiles);
-      persist("draft", { silent: true, files: nextFiles });
+      persist("draft", { files: nextFiles });
       toast(`${fa(loaded.length)} فایل پیوست و ذخیره شد.`);
     } catch {
       toast("خواندن فایل ناموفق بود.", true);
@@ -372,9 +364,11 @@ export default function IntakeModal({
   }
 
   function removeFile(id: string) {
+    const removed = attachments.find((file) => file.id === id);
+    if (removed?.storageKey) void removeAttachment(removed.storageKey).catch(() => {});
     const nextFiles = attachments.filter((file) => file.id !== id);
     setAttachments(nextFiles);
-    persist("draft", { silent: true, files: nextFiles });
+    persist("draft", { files: nextFiles });
   }
 
   const analysisCard = (
@@ -393,6 +387,8 @@ export default function IntakeModal({
           <small className="is-stale">تحلیل قبلی نامعتبر شد</small>
         )}
       </header>
+      <small>{storedAnalysis?.engine === "ai" ? "تحلیل سرویس هوش مصنوعی" : "حالت محلی نمایشی؛ بدون اتصال به مدل هوش مصنوعی"} • جایگزین نظر پزشک نیست</small>
+      {!storageHealthy && <p role="alert">ذخیره پایدار ناموفق است؛ این صفحه را نبندید و فضای مرورگر را بررسی کنید.</p>}
       {!storedAnalysis && (
         <p className="intake-analysis-empty">
           هنوز تحلیلی انجام نشده. با دکمه زیر یک جمع‌بندی خیلی خلاصه از همه
@@ -630,31 +626,7 @@ export default function IntakeModal({
                   {!!attachments.length && (
                     <ul className="intake-file-list">
                       {attachments.map((file) => (
-                        <li key={file.id}>
-                          {file.dataUrl?.startsWith("data:image") ? (
-                            <img src={file.dataUrl} alt={file.name} />
-                          ) : (
-                            <span className="intake-file-icon">
-                              <Paperclip size={15} />
-                            </span>
-                          )}
-                          <div>
-                            <b>{file.name}</b>
-                            <small>
-                              {fileSizeLabel(file.size)} •{" "}
-                              {persianDate(file.uploadedAt.slice(0, 10))}
-                            </small>
-                          </div>
-                          {!readOnly && (
-                            <button
-                              className="icon-button"
-                              aria-label={`حذف ${file.name}`}
-                              onClick={() => removeFile(file.id)}
-                            >
-                              <Trash2 size={15} />
-                            </button>
-                          )}
-                        </li>
+                        <AttachmentView key={file.id} file={file} onRemove={readOnly ? undefined : () => removeFile(file.id)} />
                       ))}
                     </ul>
                   )}
@@ -918,58 +890,12 @@ function QuestionInput({
   onBlur?: () => void;
   disabled?: boolean;
 }) {
-  if (question.type === "choice") {
-    return (
-      <div className="intake-options">
-        {question.options?.map((option) => (
-          <button
-            type="button"
-            key={option}
-            aria-label={option}
-            aria-pressed={value === option}
-            className={value === option ? "chosen" : ""}
-            disabled={disabled}
-            onClick={() => (onChoice || onChange)(option)}
-            onBlur={onBlur}
-          >
-            {value === option && <Check size={13} />}
-            {option}
-          </button>
-        ))}
-      </div>
-    );
-  }
-  if (question.type === "textarea")
-    return (
-      <textarea
-        aria-label={question.label}
-        rows={4}
-        maxLength={1200}
-        value={value}
-        disabled={disabled}
-        placeholder={question.placeholder}
-        onChange={(event) => onChange(event.target.value)}
-        onBlur={onBlur}
-      />
-    );
   return (
-    <input
-      aria-label={question.label}
-      type={
-        question.type === "number"
-          ? "number"
-          : question.type === "date"
-            ? "date"
-            : "text"
-      }
-      min={question.type === "number" ? 0 : undefined}
-      max={question.type === "number" ? 10 : undefined}
-      maxLength={300}
-      value={value}
-      disabled={disabled}
-      placeholder={question.placeholder}
-      onChange={(event) => onChange(event.target.value)}
-      onBlur={onBlur}
-    />
+    <div className="intake-free-answer">
+      {question.options && <div className="intake-options">
+        {question.options.map((option) => <button type="button" key={option} aria-label={option} aria-pressed={value === option} className={value === option ? "chosen" : ""} disabled={disabled} onClick={() => (onChoice || onChange)(option)} onBlur={onBlur}>{option}</button>)}
+      </div>}
+      <textarea aria-label={question.label} rows={3} maxLength={5000} value={value} disabled={disabled} placeholder={question.placeholder || "هرچه لازم می‌دانید با زبان خودتان بنویسید…"} onChange={(event) => onChange(event.target.value)} onBlur={onBlur} />
+    </div>
   );
 }

@@ -111,7 +111,7 @@ test("analysis button shows a concise summary with details, goes stale on edit, 
   await dialog
     .getByLabel("داروهای فعلی", { exact: true })
     .fill("تغییر جدید برای تست دارویی");
-  await dialog.getByLabel("داروهای فعلی", { exact: true }).blur();
+  // Staleness must be visible before blur/autosave.
   await expect(dialog.locator(".intake-stale-note")).toContainText("نامعتبر");
   await expect(dialog.locator(".intake-analysis").first()).toContainText(
     "تحلیل قبلی نامعتبر شد",
@@ -124,7 +124,7 @@ test("analysis button shows a concise summary with details, goes stale on edit, 
     (item: { patientId: string }) => item.patientId === "p1",
   );
   expect(saved.status).toBe("submitted");
-  expect(saved.analysis.summary).toContain("تغییر جدید برای تست دارویی");
+  expect(saved.analysis.topics.find((topic: { id: string }) => topic.id === "meds").summary).toContain("تغییر جدید برای تست دارویی");
   // Record shows the fresh analysis with its own details toggle.
   await page
     .locator(".sidebar-navigation")
@@ -229,4 +229,19 @@ test("patient inbox opens the dedicated full-page intake on mobile", async ({
       () => document.documentElement.scrollWidth <= innerWidth,
     ),
   ).toBe(true);
+});
+
+
+test("free multiline answers survive Escape without blur", async ({ page }) => {
+  await asPatient(page);
+  const dialog = await openIntake(page);
+  await dialog.getByRole("button", { name: "فرم سریع" }).click();
+  const input = dialog.getByLabel("داروهای فعلی", { exact: true });
+  await expect(input).toHaveJSProperty("tagName", "TEXTAREA");
+  await input.fill("اسم قرصم یادم نیست\nجعبه‌اش را می‌آورم");
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  await page.reload();
+  const saved = (await state(page)).intakes.find((item: { patientId: string }) => item.patientId === "p1");
+  expect(saved.answers.meds.value).toContain("جعبه‌اش را می‌آورم");
 });

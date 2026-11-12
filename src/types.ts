@@ -60,8 +60,10 @@ export interface IntakeAttachment {
   name: string;
   size: number;
   mime: string;
-  /** Small files are kept as data-URL so the demo stays fully local. */
+  /** Legacy small uploads; new files live in IndexedDB, not the JSON snapshot. */
   dataUrl?: string;
+  /** IndexedDB key for the original blob. */
+  storageKey?: string;
   uploadedAt: string;
 }
 
@@ -83,6 +85,9 @@ export interface IntakeAnalysis {
   flags: string[];
   answerHash: string;
   updatedAt: string;
+  /** Distinguish a real language-model result from the offline demo summary. */
+  engine?: "local" | "ai";
+  model?: string;
 }
 
 export interface Intake {

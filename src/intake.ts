@@ -1,4 +1,5 @@
-import type { ClinicData, Doctor, Intake, Patient } from "./types";
+import type { ClinicData, Doctor, Intake, IntakeAnalysis, IntakeAnalysisTopic, IntakeAnswer, IntakeAttachment, Patient } from "./types";
+import { localDate, shiftDate } from "./data";
 
 export interface IntakeQuestion {
   id: string;
@@ -346,46 +347,74 @@ export function normalizeIntake(
     specialty: string;
   },
 ): Intake {
-  const { answers, attachments, ...rest } = raw as Partial<Intake>;
+  const { answers, attachments, analysis, ...rest } = raw;
   return {
     status: "draft",
     updatedAt: new Date().toISOString(),
     ...rest,
-    answers: answers || {},
-    attachments: attachments || [],
+    answers: Object.fromEntries(
+      Object.entries(answers || {}).map(([key, answer]) => [
+        key,
+        {
+          value: typeof answer?.value === "string" ? answer.value : "",
+          note: typeof answer?.note === "string" ? answer.note : undefined,
+          skipped: Boolean(answer?.skipped),
+          updatedAt: answer?.updatedAt || raw.updatedAt || new Date().toISOString(),
+        },
+      ]),
+    ),
+    attachments: (attachments || []).filter(
+      (file) => file && typeof file.id === "string" && typeof file.name === "string",
+    ),
+    ...(analysis && typeof analysis.summary === "string"
+      ? {
+          analysis: {
+            ...analysis,
+            engine: analysis.engine === "ai" ? "ai" : "local",
+            topics: Array.isArray(analysis.topics) ? analysis.topics : [],
+            flags: Array.isArray(analysis.flags) ? analysis.flags : [],
+          },
+        }
+      : {}),
   } as Intake;
 }
 
+/** Canonical fingerprint of every answer, note and attachment, independent of order. */
 export function intakeAnswerHash(
   answers: Record<string, { value?: string; note?: string; skipped?: boolean }>,
-  attachments: { id: string; name: string; size: number }[] = [],
+  attachments: Pick<IntakeAttachment, "id" | "name" | "size" | "mime" | "uploadedAt">[] = [],
 ): string {
-  const keys = Object.keys(answers).sort();
-  const core = keys
-    .map((key) => {
-      const answer = answers[key] || {};
-      return `${key}=${(answer.value || "").trim()}|${(answer.note || "").trim()}|${answer.skipped ? "1" : "0"}`;
-    })
-    .join("~");
-  const files = attachments
-    .map((file) => `${file.id}:${file.name}:${file.size}`)
+  const clean = Object.keys(answers)
     .sort()
-    .join("~");
-  return `${core}##${files}`;
+    .map((key) => [
+      key,
+      (answers[key]?.value || "").trim().replace(/\r\n/g, "\n"),
+      (answers[key]?.note || "").trim().replace(/\r\n/g, "\n"),
+      Boolean(answers[key]?.skipped),
+    ]);
+  const files = attachments
+    .map((file) => [file.id, file.name, file.size, file.mime, file.uploadedAt])
+    .sort((a, b) => String(a[0]).localeCompare(String(b[0])));
+  return JSON.stringify({ answers: clean, files });
 }
 
 export function isAnalysisStale(intake: Intake | undefined): boolean {
-  if (!intake?.analysis) return true;
   return (
-    intake.analysis.answerHash !==
-    intakeAnswerHash(intake.answers, intake.attachments)
+    !intake?.analysis ||
+    intake.analysis.answerHash !== intakeAnswerHash(intake.answers, intake.attachments)
   );
 }
 
+export function hasIntakeResponse(answer?: Partial<Pick<IntakeAnswer, "value" | "note" | "skipped">>) {
+  return Boolean(
+    answer && !answer.skipped && (answer.value?.trim() || answer.note?.trim()),
+  );
+}
+
+const negative = /^(ندارم|نداشته[‌ام]*|نه|خیر|هیچی|هیچ[‌کدام]*|هیچ‌کدام|هیچکدام|no|none|-)\s*[.!؟]?$/i;
 const hasMeaning = (value = "") => {
   const text = value.trim();
-  if (!text) return false;
-  return !/^(ندارم|نه|خیر|هیچی|هیچ‌کدام|هیچکدام|nope?|-)$/i.test(text);
+  return Boolean(text) && !negative.test(text);
 };
 
 function short(value: string, max = 90) {
@@ -393,246 +422,137 @@ function short(value: string, max = 90) {
   return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 }
 
-/**
- * Fully local, rule-based "AI-style" summary. It never calls a server;
- * it only rewrites what the patient already wrote into a very short
- * summary plus one line per topic with expandable details.
- */
+/** Offline demo fallback. This is deliberately not presented as a language model. */
 export function buildIntakeAnalysis(
-  patient: Patient,
+  _patient: Patient,
   doctor: Doctor | undefined,
   questions: IntakeQuestion[],
-  answers: Record<string, { value?: string; note?: string }>,
+  answers: Record<string, { value?: string; note?: string; skipped?: boolean }>,
   attachments: { name: string }[] = [],
-): {
-  summary: string;
-  topics: Intake["analysis"] extends { topics: infer T } | undefined
-    ? T
-    : never;
-  flags: string[];
-} {
-  const get = (id: string) => (answers[id]?.value || "").trim();
-  const note = (id: string) => (answers[id]?.note || "").trim();
-  const withNote = (id: string) => {
-    const extra = note(id);
-    return extra ? ` — توضیح شما: ${short(extra, 110)}` : "";
-  };
-  const topics: {
-    id: string;
-    title: string;
-    summary: string;
-    detail: string;
-    tone: "info" | "warn" | "good";
-  }[] = [];
+): Pick<IntakeAnalysis, "summary" | "topics" | "flags" | "engine"> {
+  const topics: IntakeAnalysisTopic[] = [];
   const flags: string[] = [];
-
-  const meds = get("meds");
-  if (hasMeaning(meds)) {
+  let answered = 0;
+  for (const question of questions) {
+    const answer = answers[question.id];
+    const value = (answer?.value || "").trim();
+    const note = (answer?.note || "").trim();
+    if (!value && !note) continue;
+    answered += 1;
+    const text = value || note;
+    const uncertain = /نمی‌دانم|مطمئن نیستم|فکر کنم|احتمال|شاید/.test(text);
     topics.push({
-      id: "meds",
-      title: "داروها",
-      summary: short(meds, 70),
-      detail: `داروهایی که نوشتید: ${meds}${withNote("meds")} این فهرست در ویزیت برای بررسی تداخل دارویی استفاده می‌شود.`,
-      tone: "info",
+      id: question.id,
+      title: question.label,
+      summary: short(text, 100),
+      detail: [
+        value ? `پاسخ بیمار:\n${value}` : "",
+        note ? `توضیح بیمار:\n${note}` : "",
+        answer?.skipped ? "بیمار فعلاً پاسخ قطعی نداده است." : "",
+        uncertain ? "این مورد با عدم قطعیت بیان شده و باید در ویزیت روشن شود." : "",
+      ].filter(Boolean).join("\n\n"),
+      tone: uncertain ? "warn" : "info",
     });
-  } else {
-    topics.push({
-      id: "meds",
-      title: "داروها",
-      summary: "داروی خاصی ثبت نشده",
-      detail: `نوشتید دارویی مصرف نمی‌کنید.${withNote("meds")} اگر هفته پیش برای سرماخوردگی چیزی خوردید، همین‌جا اضافه کنید.`,
-      tone: "good",
-    });
+    if (question.id === "allergy" && hasMeaning(value || note) && !/ندارم|نداشته/.test(text)) {
+      flags.push(`حساسیت گزارش‌شده: ${short(text, 65)}${uncertain ? " (نیازمند تأیید)" : ""}`);
+    }
+    if (question.id === "pregnancy" && /بله|احتمال|باردار/.test(text)) {
+      flags.push("بارداری یا احتمال آن گزارش شده؛ بررسی ایمنی دارو و تصویربرداری لازم است.");
+    }
   }
-
-  const allergy = get("allergy");
-  if (hasMeaning(allergy) && !/ندارم/.test(allergy)) {
-    flags.push(`حساسیت: ${short(allergy, 60)}`);
-    topics.push({
-      id: "allergy",
-      title: "حساسیت",
-      summary: short(allergy, 70),
-      detail: `حساسیت ثبت‌شده: ${allergy}${withNote("allergy")} این مورد در پرونده و اتاق ویزیت برجسته می‌شود.`,
-      tone: "warn",
-    });
-  } else {
-    topics.push({
-      id: "allergy",
-      title: "حساسیت",
-      summary: "حساسیت خاصی گفته نشده",
-      detail: `پاسخ شما: ${allergy || "—"}${withNote("allergy")}`,
-      tone: "good",
-    });
-  }
-
-  const surgery = get("surgery");
-  topics.push({
-    id: "surgery",
-    title: "عمل‌های قبلی",
-    summary: hasMeaning(surgery) ? short(surgery, 70) : "عملی گفته نشده",
-    detail: hasMeaning(surgery)
-      ? `سوابقی که نوشتید: ${surgery}${withNote("surgery")}`
-      : `نوشتید عملی نداشته‌اید.${withNote("surgery")} مثال عامیانه قابل قبول است: «پارسال عمل آپاندیس داشتم».`,
-    tone: hasMeaning(surgery) ? "info" : "good",
-  });
-
-  const episode = get("episode");
-  topics.push({
-    id: "episode",
-    title: "آخرین بدحالی",
-    summary: hasMeaning(episode)
-      ? short(episode, 70)
-      : "بدحالی مرتبطی گفته نشده",
-    detail: hasMeaning(episode)
-      ? `شرح شما: ${episode}${withNote("episode")} زمان، علائم و چیزی که بهترتان کرد برای پزشک مهم است.`
-      : `چیزی ثبت نشده.${withNote("episode")} مثال: «هفته پیش سرماخوردم، سه روز تب خفیف داشتم».`,
-    tone: hasMeaning(episode) ? "info" : "good",
-  });
-
-  const specialty = doctor?.specialty || "عمومی";
-  const specialtyAnswers = questions
-    .filter(
-      (question) =>
-        !["meds", "allergy", "surgery", "episode"].includes(question.id),
-    )
-    .map((question) => ({ question, value: get(question.id) }))
-    .filter((row) => row.value || note(row.question.id));
-  if (specialtyAnswers.length) {
-    const headline = specialtyAnswers
-      .slice(0, 2)
-      .map(
-        (row) =>
-          `${row.question.label}: ${short(row.value || "توضیح ثبت شده", 48)}`,
-      )
-      .join("؛ ");
-    topics.push({
-      id: "specialty",
-      title: `ویزیت ${specialty}`,
-      summary: headline || `پاسخ‌های ${specialty}`,
-      detail: specialtyAnswers
-        .map(
-          (row) =>
-            `${row.question.label}: ${row.value || "—"}${withNote(row.question.id)}`,
-        )
-        .join("\n"),
-      tone: "info",
-    });
-  }
-
-  // Simple red-flag language detection (informational only, not a diagnosis).
-  const allText = Object.values(answers)
-    .map((answer) => `${answer.value || ""} ${answer.note || ""}`)
-    .join(" ");
-  if (/درد قفسه سینه|تنگی نفس|فشار.*سینه|بیهوش|غش/.test(allText))
-    flags.push("درد قفسه سینه یا تنگی نفس گفته شده؛ در ویزیت حتماً مطرح شود.");
-  if (/باردار|احتمال.*باردار/.test(allText))
-    flags.push(
-      "احتمال بارداری گفته شده؛ برای ایمنی دارو و تصویربرداری مهم است.",
-    );
-  if (/فشار.*(۱۹|۲۰|۲[0-9]{2})|200\//.test(allText))
-    flags.push("عدد فشار خون بالا دیده شد؛ اندازه‌گیری تکرار شود.");
-
+  const missing = questions.filter(
+    (question) => question.required && !hasIntakeResponse(answers[question.id]),
+  );
+  if (missing.length) flags.push(`${missing.length} پرسش ضروری هنوز پاسخ کامل ندارد.`);
   if (attachments.length) {
     topics.push({
       id: "files",
-      title: "مدارک",
-      summary: `${attachments.length} فایل پیوست شد`,
-      detail: `فایل‌ها: ${attachments.map((file) => file.name).join("، ")}. پزشک می‌تواند آن‌ها را در پرونده ببیند.`,
+      title: "آزمایش‌ها و مدارک",
+      summary: `${attachments.length} فایل پیوست شده؛ محتوای فایل در تحلیل محلی خوانده نمی‌شود.`,
+      detail: `فایل‌های پیوست‌شده:\n${attachments.map((file) => `• ${file.name}`).join("\n")}\n\nاین خلاصه فقط وجود فایل را ثبت می‌کند؛ نتیجه آزمایش از نام فایل یا تصویر حدس زده نمی‌شود. پزشک باید اصل مدرک را بررسی کند.`,
       tone: "info",
     });
   }
-
-  const name = patient.name.split(" ")[0];
-  const summary = `${name} ${patient.age} ساله؛ ${topics
-    .slice(0, 3)
-    .map((topic) => `${topic.title}: ${topic.summary}`)
-    .join(" • ")}${flags.length ? ` • نیازمند توجه: ${flags[0]}` : ""}`;
-  return { summary, topics, flags };
+  const allergy = topics.find((topic) => topic.id === "allergy");
+  const summary = !answered
+    ? "هنوز پاسخی برای جمع‌بندی ثبت نشده است. توضیح‌های خود را به زبان ساده بنویسید."
+    : short(
+        `${answered} مورد از شرح حال شما مرور شد.${allergy && hasMeaning(`${answers.allergy?.value || ""} ${answers.allergy?.note || ""}`) && !/ندارم|نداشته/.test(`${answers.allergy?.value || ""} ${answers.allergy?.note || ""}`) ? " حساسیت گزارش‌شده برای بررسی پزشک جدا شد." : ` نکته‌های مربوط به ویزیت ${doctor?.specialty || "پیش رو"} در جزئیات آمده است.`}`,
+        220,
+      );
+  return { summary, topics, flags, engine: "local" };
 }
 
-/** Colloquial, non-clinical example answers a real patient might write. */
+/** A complete, fictional, lay-person example for every supported visit type. */
 export function exampleIntakeAnswers(
   patient: Patient,
   doctor: Doctor | undefined,
 ): Record<string, { value: string; note: string }> {
   const neuro = doctor?.specialty === "مغز و اعصاب";
   const cardio = doctor?.specialty === "قلب و عروق";
+  const child = doctor?.specialty === "اطفال";
   const base: Record<string, { value: string; note: string }> = {
     meds: {
-      value: "هفته پیش سرماخوردم، فقط استامینوفن خوردم؛ الان قرص خاصی نمی‌خورم",
-      note: "اگه سردردم شدید بشه یه استامینوفن می‌خورم، حدود ماهی دو سه بار",
+      value: child
+        ? "هفته پیش سرما خوردگی داشت و دکتر شربت استامینوفن داده بود.\nالان داروی دیگری نمی‌خورد."
+        : "هفته پیش سرماخوردم و چند تا استامینوفن خوردم.\nالان قرص خاصی نمی‌خورم؛ اگر درد داشته باشم گاهی استامینوفن می‌خورم.",
+      note: "اسم دقیق داروها را همیشه یادم نمی‌ماند.\nجعبه دارو را می‌توانم روز ویزیت نشان بدهم.",
     },
     allergy: {
-      value: "فکر کنم به پنی‌سیلین حساسیت دارم، بچگی که بودم کهیر زدم",
-      note: "مطمئن نیستم، ولی ترجیح می‌دم ننویسید برام",
+      value: "فکر کنم به پنی‌سیلین حساسیت دارم.\nبچگی یک بار بعد از دارو بدنم کهیر زد.",
+      note: "مطمئن نیستم اسم دارو پنی‌سیلین بوده یا نه.\nپزشک اگر لازم بداند دوباره بررسی کند.",
     },
     surgery: {
-      value: "پارسال عمل آپاندیس داشتم، دو سه روز بیمارستان بودم",
-      note: "بعدش مشکلی نداشتم، فقط جای بخیه گاهی می‌خاره",
+      value: child
+        ? "تا حالا عمل جراحی نداشته.\nفقط یک بار موقع سرماخوردگی دکتر بستری‌اش کرد."
+        : "پارسال عمل آپاندیس داشتم.\nدو سه روز بیمارستان بودم و بعدش خوب شدم.",
+      note: child ? "منظورم بستری کوتاه بود، عمل نکردند." : "جای بخیه گاهی می‌خارد ولی درد ندارد.",
     },
     episode: {
       value: neuro
-        ? "پنجشنبه هفته پیش از ظهر یه سردرد بد گرفتم، حدود ۶ ساعت طول کشید، با تهوع بود؛ خوابیدم بهتر شدم"
+        ? "پنجشنبه هفته پیش سردرد بدی گرفتم.\nنور اذیتم می‌کرد و کمی حالت تهوع داشتم. خوابیدم بهتر شدم."
         : cardio
-          ? "هفته پیش وقتی از پله‌ها بالا رفتم قفسه سینه‌م سنگین شد، حدود ده دقیقه؛ نشستم بهتر شد"
-          : "هفته پیش سرماخوردم، سه روز تب خفیف و بدن‌درد داشتم؛ با استراحت خوب شدم",
-      note: "قبلش کم خوابیده بودم و استرس داشتم",
+          ? "هفته پیش وقتی از پله بالا رفتم سینه‌ام سنگین شد.\nنشستم و بعد از چند دقیقه بهتر شدم."
+          : "هفته پیش سرماخوردم.\nسه روز تب خفیف و بدن‌درد داشتم؛ با استراحت خوب شدم.",
+      note: "قبلش کم خوابیده بودم و کارهایم زیاد بود.\nاز وقتی یادم هست این اتفاق گاهی می‌افتد.",
     },
+    onset: { value: "چند هفته", note: "اولش ماهی یک بار بود.\nالان هفته‌ای یک بار می‌شود." },
+    neuro: { value: "تهوع یا استفراغ", note: "نور هم اذیتم می‌کند.\nمی‌روم اتاق تاریک تا بهتر شوم." },
+    trigger: { value: "کم‌خوابی و استرس بدترش می‌کند.\nخوابیدن بهترش می‌کند.", note: "قهوه زیاد هم انگار اثر دارد." },
+    imaging: { value: "تا حالا MRI یا CT مغز نداشتم.", note: "دکتر قبلی فقط با معاینه دارو داد." },
+    chest: { value: "فقط هنگام فعالیت", note: "موقع تند راه رفتن یا پله.\nوقتی می‌نشینم بهتر می‌شوم." },
+    homebp: { value: "دیشب دستگاه خانه ۱۴۵ روی ۹۰ نشان داد.", note: "دستگاه قدیمی است.\nنمی‌دانم دقیق اندازه می‌گیرد یا نه." },
+    cardiac: { value: "عمل قلب نداشتم.\nپارسال نوار قلب گرفتم و گفتند مشکلی نیست.", note: "برگه نوار قلب را دارم." },
+    family: { value: "بابام فشار خون داشت.", note: "برادرم هم گاهی فشارش بالا می‌رود." },
+    guardian: { value: `من ${patient.emergencyContact.name || "مادر کودک"} هستم، ${patient.emergencyContact.relation || "مادر"}ش.`, note: "کارت واکسن را هم آورده‌ام." },
+    fever: { value: "نداشته", note: "دیروز تب نداشت.\nامروز هم بازی می‌کند و غذا می‌خورد." },
+    vaccine: { value: "کامل", note: "طبق کارت واکسن همه را زده‌ایم." },
+    injury: { value: "خیر", note: "یادم نیست زمین خورده باشم.\nکم‌کم دردش شروع شد." },
+    pain: { value: "5", note: "موقع راه رفتن بیشتر می‌شود.\nاستراحت که می‌کنم کمتر است." },
+    implant: { value: "پلاتین و مفصل مصنوعی ندارم.", note: "تا حالا دکتر برای پایم عمل نکرده." },
+    vision: { value: "تدریجی", note: "چند ماه است تابلوها را تار می‌بینم.\nبا عینک قبلی بهتر نمی‌شود." },
+    lens: { value: "عینک می‌زنم، لنز نه.", note: "نمره عینکم را یادم نیست.\nخود عینک را می‌آورم." },
+    eyesurgery: { value: "تا حالا چشمم را عمل نکرده‌ام.", note: "لیزر هم نرفته‌ام." },
+    lmp: { value: shiftDate(localDate(), -18), note: "تقریباً دو سه هفته پیش بود.\nروز دقیقش یادم نیست." },
+    pregnancy: { value: "خیر", note: "پریودم را داشته‌ام.\nفکر نمی‌کنم باردار باشم." },
+    gyn: { value: "عمل زنان نداشتم.\nزایمان هم نداشتم.", note: "معاینه معمولی قبلاً رفته‌ام." },
+    reason: { value: "چند روزی است حالم خیلی خوب نیست.\nمی‌خواهم دکتر بررسی کند.", note: "هفته پیش سرماخوردم.\nالان بهترم ولی خسته‌ام." },
+    falls: { value: "خیر", note: "این چند ماه زمین نخورده‌ام.\nموقع بلند شدن هم سرگیجه ندارم." },
   };
-  if (neuro) {
-    base.onset = {
-      value: "چند هفته",
-      note: "اولش ماهی یه بار بود، الان هفته‌ای یه بار می‌شه",
-    };
-    base.neuro = {
-      value: "تهوع یا استفراغ",
-      note: "نور هم اذیتم می‌کنه، مجبور می‌شم برم تو اتاق تاریک",
-    };
-    base.trigger = {
-      value: "کم‌خوابی و استرس بدترش می‌کنه، خواب بهترش می‌کنه",
-      note: "قهوه هم اگه زیاد بخورم بدتر می‌شم",
-    };
-    base.imaging = { value: "ندارم", note: "" };
-  }
-  if (cardio) {
-    base.chest = {
-      value: "فقط هنگام فعالیت",
-      note: "موقع تند راه رفتن یا پله، موقع نشستن خوبم",
-    };
-    base.homebp = {
-      value: "دیشب ۱۴۵ روی ۹۰ بود",
-      note: "دستگاه خونه‌م قدیمیه، نمی‌دونم دقیق باشه یا نه",
-    };
-    base.cardiac = {
-      value: "ندارم، فقط پارسال یه نوار قلب گرفتم گفتن مشکلی نیست",
-      note: "",
-    };
-    base.family = { value: "بابام فشار خون داشت", note: "" };
-  }
-  if (patient.age >= 60) base.falls = { value: "خیر", note: "" };
   return base;
 }
 
-export function intakeProgress(
-  intake: Intake | undefined,
-  questions: IntakeQuestion[],
-) {
+export function intakeProgress(intake: Intake | undefined, questions: IntakeQuestion[]) {
   const required = questions.filter((question) => question.required);
-  const answered = required.filter((question) => {
-    const answer = intake?.answers[question.id];
-    return answer && !answer.skipped && answer.value.trim().length > 0;
-  });
+  const answered = required.filter((question) => hasIntakeResponse(intake?.answers[question.id]));
   const optionalAnswered = questions.filter(
-    (question) =>
-      !question.required && intake?.answers[question.id]?.value.trim(),
+    (question) => !question.required && hasIntakeResponse(intake?.answers[question.id]),
   ).length;
   return {
     required: required.length,
     answered: answered.length,
     optionalAnswered,
-    percent: required.length
-      ? Math.round((answered.length / required.length) * 100)
-      : 100,
+    percent: required.length ? Math.round((answered.length / required.length) * 100) : 100,
     complete: answered.length === required.length,
     missing: required.filter((question) => !answered.includes(question)),
   };
@@ -640,45 +560,39 @@ export function intakeProgress(
 
 export function careFocus(patient: Patient, doctor: Doctor | undefined) {
   const specialty = doctor?.specialty || "عمومی";
-  const reasons = [
-    `${patient.age} سال`,
-    patient.gender,
-    patient.maritalStatus,
-    specialty,
-  ];
-  const focus: Record<string, { title: string; note: string; tags: string[] }> =
-    {
-      "مغز و اعصاب": {
-        title: "تمرکز امروز: سردرد و میگرن",
-        note: "سوابق سردرد، محرک‌ها و تصویربرداری قبلی برای این ویزیت مهم‌ترند.",
-        tags: ["سردرد", "MRI قبلی", "محرک‌ها"],
-      },
-      "قلب و عروق": {
-        title: "تمرکز امروز: قلب و فشار خون",
-        note: "فشار خون خانگی، درد قفسه سینه و سابقه خانوادگی در اولویت‌اند.",
-        tags: ["فشار خون", "درد سینه", "سابقه خانوادگی"],
-      },
-      اطفال: {
-        title: "تمرکز امروز: رشد و علائم کودک",
-        note: "تب، تغذیه و وضعیت واکسیناسیون مرور می‌شود.",
-        tags: ["تب", "واکسن", "رشد"],
-      },
-      ارتوپدی: {
-        title: "تمرکز امروز: درد و حرکت",
-        note: "آسیب اخیر، شدت درد و جراحی‌های قبلی مرور می‌شود.",
-        tags: ["درد", "آسیب", "جراحی"],
-      },
-      چشم‌پزشکی: {
-        title: "تمرکز امروز: بینایی",
-        note: "تغییر بینایی و جراحی‌های چشم در اولویت‌اند.",
-        tags: ["بینایی", "عینک", "جراحی چشم"],
-      },
-      "زنان و زایمان": {
-        title: "تمرکز امروز: سلامت زنان",
-        note: "تاریخ قاعدگی و وضعیت بارداری برای ایمنی مراقبت مهم است.",
-        tags: ["قاعدگی", "بارداری", "سوابق"],
-      },
-    };
+  const reasons = [`${patient.age} سال`, patient.gender, patient.maritalStatus, specialty];
+  const focus: Record<string, { title: string; note: string; tags: string[] }> = {
+    "مغز و اعصاب": {
+      title: "تمرکز امروز: سردرد و میگرن",
+      note: "سوابق سردرد، محرک‌ها و تصویربرداری قبلی برای این ویزیت مهم‌ترند.",
+      tags: ["سردرد", "MRI قبلی", "محرک‌ها"],
+    },
+    "قلب و عروق": {
+      title: "تمرکز امروز: قلب و فشار خون",
+      note: "فشار خون خانگی، درد قفسه سینه و سابقه خانوادگی در اولویت‌اند.",
+      tags: ["فشار خون", "درد سینه", "سابقه خانوادگی"],
+    },
+    اطفال: {
+      title: "تمرکز امروز: رشد و علائم کودک",
+      note: "تب، تغذیه و وضعیت واکسیناسیون مرور می‌شود.",
+      tags: ["تب", "واکسن", "رشد"],
+    },
+    ارتوپدی: {
+      title: "تمرکز امروز: درد و حرکت",
+      note: "آسیب اخیر، شدت درد و جراحی‌های قبلی مرور می‌شود.",
+      tags: ["درد", "آسیب", "جراحی"],
+    },
+    "چشم‌پزشکی": {
+      title: "تمرکز امروز: بینایی",
+      note: "تغییر بینایی و جراحی‌های چشم در اولویت‌اند.",
+      tags: ["بینایی", "عینک", "جراحی چشم"],
+    },
+    "زنان و زایمان": {
+      title: "تمرکز امروز: سلامت زنان",
+      note: "تاریخ قاعدگی و وضعیت بارداری برای ایمنی مراقبت مهم است.",
+      tags: ["قاعدگی", "بارداری", "سوابق"],
+    },
+  };
   const base = focus[specialty] || {
     title: "تمرکز امروز: شرح حال شما",
     note: "علت مراجعه و داروهای فعلی مرور می‌شود.",

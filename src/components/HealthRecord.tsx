@@ -1,3 +1,4 @@
+import AttachmentView from "./AttachmentView";
 import { useMemo, useState, type FormEvent } from "react";
 import {
   Activity,
@@ -658,6 +659,7 @@ export default function HealthRecord({ patientId }: { patientId: string }) {
                             <li key={topic.id}>
                               <span>{topic.title}</span>
                               <b>{topic.summary}</b>
+                              <p style={{ whiteSpace: "pre-wrap" }}>{topic.detail}</p>
                             </li>
                           ))}
                         </ul>
@@ -665,16 +667,11 @@ export default function HealthRecord({ patientId }: { patientId: string }) {
                     </div>
                   )}
                   {!!intake.attachments?.length && (
-                    <div className="ehr-files">
+                    <ul className="ehr-files">
                       {intake.attachments.map((file) => (
-                        <span key={file.id}>
-                          {file.dataUrl?.startsWith("data:image") ? (
-                            <img src={file.dataUrl} alt={file.name} />
-                          ) : null}
-                          {file.name}
-                        </span>
+                        <AttachmentView key={file.id} file={file} compact />
                       ))}
-                    </div>
+                    </ul>
                   )}
                   <ul>
                     {questions.map((question) => (
